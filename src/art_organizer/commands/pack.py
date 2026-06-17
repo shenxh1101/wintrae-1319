@@ -50,31 +50,72 @@ def group_by_project(files: List[Path], group_by: str) -> Dict[str, List[Path]]:
     return groups
 
 
-def generate_manifest(files: List[Path], output_path: Path, format: str = "json"):
+def generate_manifest(
+    files: List[Path],
+    output_path: Path,
+    source_directory: str,
+    group_name: str,
+    delivery_path: Optional[Path] = None,
+    format: str = "json",
+):
     """生成素材包清单文件。"""
+    image_count = sum(1 for f in files if is_image_file(f))
+    brush_count = sum(1 for f in files if is_brush_file(f))
+    all_tags = []
+    for f in files:
+        all_tags.extend(extract_tags(f.name))
+    unique_tags = sorted(list(set(all_tags)))
+
     manifest = {
-        "generated_at": datetime.now().isoformat(),
-        "total_files": len(files),
-        "total_size": sum(f.stat().st_size for f in files),
+        "manifest_info": {
+            "generated_at": datetime.now().isoformat(),
+            "group_name": group_name,
+            "source_directory": str(Path(source_directory).resolve()),
+            "delivery_directory": str(delivery_path.resolve()) if delivery_path else None,
+            "manifest_file": str(output_path.resolve()),
+        },
+        "summary": {
+            "total_files": len(files),
+            "total_size_bytes": sum(f.stat().st_size for f in files),
+            "total_size_human": human_readable_size(sum(f.stat().st_size for f in files)),
+            "image_files": image_count,
+            "brush_files": brush_count,
+            "unique_tags": unique_tags,
+            "tags_count": len(unique_tags),
+        },
+        "delivery_structure": {
+            "root": group_name,
+            "files": [f.name for f in sorted(files)],
+        },
         "files": []
     }
 
-    for file_path in files:
+    for file_path in sorted(files):
         info = get_image_info(file_path)
+        tags = extract_tags(file_path.name)
         file_entry = {
             "filename": file_path.name,
-            "path": str(file_path),
+            "source_path": str(file_path.resolve()),
+            "source_directory": str(file_path.parent.resolve()),
+            "delivery_path": str(delivery_path / file_path.name) if delivery_path else None,
             "size_bytes": file_path.stat().st_size,
+            "size_human": human_readable_size(file_path.stat().st_size),
             "extension": info["extension"],
             "type": "image" if info["is_image"] else "brush",
-            "tags": extract_tags(file_path.name),
+            "tags": tags,
+            "tags_formatted": ' '.join(f'[{t}]' for t in tags),
             "created_at": get_file_date(file_path).isoformat(),
+            "created_at_formatted": get_file_date(file_path).strftime("%Y-%m-%d %H:%M:%S"),
         }
         if info["dimensions"]:
             file_entry["width"] = info["dimensions"][0]
             file_entry["height"] = info["dimensions"][1]
+            file_entry["resolution"] = f"{info['dimensions'][0]}x{info['dimensions'][1]}"
+            file_entry["aspect_ratio"] = round(info['dimensions'][0] / info['dimensions'][1], 2)
         if info["image_format"]:
-            file_entry["format"] = info["image_format"]
+            file_entry["image_format"] = info["image_format"]
+        if info["mode"]:
+            file_entry["color_mode"] = info["mode"]
         manifest["files"].append(file_entry)
 
     if format == "json":
@@ -84,24 +125,103 @@ def generate_manifest(files: List[Path], output_path: Path, format: str = "json"
         with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                "文件名", "路径", "大小(字节)", "扩展名", "类型", "标签",
-                "创建日期", "宽度", "高度", "格式"
+                "序号", "文件名", "来源路径", "来源目录", "交付路径",
+                "大小(字节)", "大小", "扩展名", "类型",
+                "标签", "标签格式", "创建日期",
+                "宽度", "高度", "分辨率", "宽高比", "图片格式", "色彩模式"
             ])
-            for fe in manifest["files"]:
+            for idx, fe in enumerate(manifest["files"], 1):
                 writer.writerow([
+                    idx,
                     fe["filename"],
-                    fe["path"],
+                    fe["source_path"],
+                    fe["source_directory"],
+                    fe.get("delivery_path", ""),
                     fe["size_bytes"],
+                    fe["size_human"],
                     fe["extension"],
                     fe["type"],
                     ','.join(fe["tags"]),
-                    fe["created_at"],
+                    fe["tags_formatted"],
+                    fe["created_at_formatted"],
                     fe.get("width", ""),
                     fe.get("height", ""),
-                    fe.get("format", ""),
+                    fe.get("resolution", ""),
+                    fe.get("aspect_ratio", ""),
+                    fe.get("image_format", ""),
+                    fe.get("color_mode", ""),
                 ])
 
     return manifest
+
+
+def generate_summary_manifest(
+    all_groups: Dict[str, List[Path]],
+    output_path: Path,
+    source_directory: str,
+    format: str = "json",
+):
+    """生成总的素材包汇总清单。"""
+    total_files = sum(len(files) for files in all_groups.values())
+    total_size = sum(f.stat().st_size for files in all_groups.values() for f in files)
+    all_tags = []
+    for files in all_groups.values():
+        for f in files:
+            all_tags.extend(extract_tags(f.name))
+    unique_tags = sorted(list(set(all_tags)))
+
+    summary = {
+        "manifest_info": {
+            "generated_at": datetime.now().isoformat(),
+            "source_directory": str(Path(source_directory).resolve()),
+            "summary_file": str(output_path.resolve()),
+        },
+        "overview": {
+            "total_groups": len(all_groups),
+            "total_files": total_files,
+            "total_size_bytes": total_size,
+            "total_size_human": human_readable_size(total_size),
+            "unique_tags": unique_tags,
+            "tags_count": len(unique_tags),
+        },
+        "groups": [],
+    }
+
+    for group_name in sorted(all_groups.keys()):
+        group_files = all_groups[group_name]
+        group_size = sum(f.stat().st_size for f in group_files)
+        group_tags = set()
+        for f in group_files:
+            group_tags.update(extract_tags(f.name))
+        summary["groups"].append({
+            "group_name": group_name,
+            "file_count": len(group_files),
+            "total_size_bytes": group_size,
+            "total_size_human": human_readable_size(group_size),
+            "tags": sorted(list(group_tags)),
+            "files": [f.name for f in sorted(group_files)],
+        })
+
+    if format == "json":
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+    elif format == "csv":
+        with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "分组", "文件数", "总大小(字节)", "总大小", "标签", "文件列表"
+            ])
+            for group in summary["groups"]:
+                writer.writerow([
+                    group["group_name"],
+                    group["file_count"],
+                    group["total_size_bytes"],
+                    group["total_size_human"],
+                    ','.join(group["tags"]),
+                    '; '.join(group["files"]),
+                ])
+
+    return summary
 
 
 def cmd_pack(
@@ -188,7 +308,14 @@ def cmd_pack(
             if dry_run:
                 click.echo(f"[yellow]将生成清单:[/yellow] {manifest_path}")
             else:
-                manifest = generate_manifest(group_files, manifest_path, manifest_format)
+                manifest = generate_manifest(
+                    group_files,
+                    manifest_path,
+                    source_directory=directory,
+                    group_name=group_name,
+                    delivery_path=group_output_dir,
+                    format=manifest_format
+                )
                 click.echo(f"[green]已生成清单:[/green] {manifest_path}")
                 all_manifest_files.extend(group_files)
 
@@ -204,12 +331,23 @@ def cmd_pack(
                     else:
                         copy_results.append((file_path.name, group_name, f"失败: {result}"))
 
-    if all_manifest_files:
+    if all_manifest_files and output_path and not dry_run:
+        summary_filename = f"00_素材包汇总_manifest.{manifest_format}"
+        summary_path = output_path / summary_filename
+        summary = generate_summary_manifest(
+            groups,
+            summary_path,
+            source_directory=directory,
+            format=manifest_format
+        )
+        click.echo(f"[green]已生成汇总清单:[/green] {summary_path}")
+
         total_size = sum(f.stat().st_size for f in all_manifest_files)
         console.print(Panel(
-            f"[bold]已生成 {len(groups)} 个清单文件[/bold]\n"
+            f"[bold]已生成 {len(groups)} 个分组清单 + 1 个汇总清单[/bold]\n"
             f"共 {len(all_manifest_files)} 个文件\n"
-            f"[bold]总大小: {human_readable_size(total_size)}[/bold]",
+            f"[bold]总大小: {human_readable_size(total_size)}[/bold]\n"
+            f"[bold]汇总清单:[/bold] {summary_path.name}",
             title="清单生成完成",
             border_style="green"
         ))

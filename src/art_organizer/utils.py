@@ -25,9 +25,28 @@ def human_readable_size(size_bytes: int) -> str:
     return f"{s} {size_names[i]}"
 
 
-def scan_files(directory: str, recursive: bool = True, extensions: Optional[set] = None) -> List[Path]:
+def scan_files(
+    directory: str,
+    recursive: bool = True,
+    extensions: Optional[set] = None,
+    images_only: bool = False,
+    brushes_only: bool = False,
+    extension_filter: Optional[str] = None,
+) -> List[Path]:
     if extensions is None:
         extensions = ALL_SUPPORTED_EXTENSIONS
+
+    if images_only:
+        extensions = IMAGE_EXTENSIONS
+    elif brushes_only:
+        extensions = BRUSH_EXTENSIONS
+
+    if extension_filter:
+        ext = extension_filter.lower()
+        if not ext.startswith('.'):
+            ext = '.' + ext
+        extensions = {ext}
+
     dir_path = Path(directory)
     if not dir_path.exists():
         raise FileNotFoundError(f"目录不存在: {directory}")
@@ -60,6 +79,24 @@ def extract_tags(filename: str) -> List[str]:
     return TAG_PATTERN.findall(filename)
 
 
+def remove_tags_from_filename(filename: str, tags_to_remove: List[str]) -> str:
+    name, ext = os.path.splitext(filename)
+    current_tags = extract_tags(name)
+    remaining_tags = [t for t in current_tags if t not in tags_to_remove]
+    name_without_tags = TAG_PATTERN.sub('', name).strip('_-. ')
+    if remaining_tags:
+        tag_str = ''.join(f'[{t}]' for t in remaining_tags)
+        if name_without_tags:
+            return f"{name_without_tags}_{tag_str}{ext}"
+        else:
+            return f"{tag_str}{ext}"
+    else:
+        if name_without_tags:
+            return f"{name_without_tags}{ext}"
+        else:
+            return filename
+
+
 def add_tags_to_filename(filename: str, tags: List[str]) -> str:
     name, ext = os.path.splitext(filename)
     existing_tags = extract_tags(name)
@@ -68,7 +105,10 @@ def add_tags_to_filename(filename: str, tags: List[str]) -> str:
     name_without_tags = TAG_PATTERN.sub('', name).strip('_-. ')
     if all_tags:
         tag_str = ''.join(f'[{t}]' for t in all_tags)
-        return f"{name_without_tags}_{tag_str}{ext}"
+        if name_without_tags:
+            return f"{name_without_tags}_{tag_str}{ext}"
+        else:
+            return f"{tag_str}{ext}"
     return filename
 
 

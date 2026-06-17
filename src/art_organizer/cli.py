@@ -37,13 +37,25 @@ def cli():
 @click.argument("directory", type=click.Path(exists=True, file_okay=False, dir_okay=True))
 @click.option("--no-recursive", is_flag=True, default=False, help="不递归处理子目录")
 @click.option("--details", "-d", is_flag=True, default=False, help="显示详细文件列表和标签统计")
+@click.option("--images-only", is_flag=True, default=False, help="仅显示图片文件")
+@click.option("--brushes-only", is_flag=True, default=False, help="仅显示画笔文件")
+@click.option("--extension", "-e", default=None, help="仅显示指定扩展名的文件，如 .png 或 png")
 @click.option("--dry-run", is_flag=True, default=False, help="预览模式，不执行任何修改")
-def scan(directory, no_recursive, details, dry_run):
-    """扫描目录中的图片和画笔文件，按尺寸和格式统计。"""
+def scan(directory, no_recursive, details, images_only, brushes_only, extension, dry_run):
+    """扫描目录中的图片和画笔文件，按尺寸和格式统计。
+
+    示例：
+      art-organizer scan ./images --images-only
+      art-organizer scan ./images --brushes-only
+      art-organizer scan ./images --extension .png
+    """
     cmd_scan(
         directory=directory,
         recursive=not no_recursive,
         show_details=details,
+        images_only=images_only,
+        brushes_only=brushes_only,
+        extension=extension,
         dry_run=dry_run
     )
 
@@ -196,8 +208,11 @@ def pack(directory, output_dir, group_by, project_tag, manifest_format, manifest
 @click.option("--no-tag", is_flag=True, default=False, help="不显示按标签统计")
 @click.option("--no-directory", is_flag=True, default=False, help="不显示按目录统计")
 @click.option("--top", "top_n", default=20, type=int, help="Top N 统计数量，默认: 20")
+@click.option("--images-only", is_flag=True, default=False, help="仅统计图片文件")
+@click.option("--brushes-only", is_flag=True, default=False, help="仅统计画笔文件")
+@click.option("--extension", "-e", default=None, help="仅统计指定扩展名的文件，如 .png 或 png")
 @click.option("--dry-run", is_flag=True, default=False, help="预览模式，不执行任何修改")
-def report(directory, no_recursive, no_extension, no_size, no_date, no_tag, no_directory, top_n, dry_run):
+def report(directory, no_recursive, no_extension, no_size, no_date, no_tag, no_directory, top_n, images_only, brushes_only, extension, dry_run):
     """输出详细的素材空间占用报告。
 
     报告包含多个维度的统计信息，帮助你了解素材库的使用情况。
@@ -205,7 +220,8 @@ def report(directory, no_recursive, no_extension, no_size, no_date, no_tag, no_d
     示例：
       art-organizer report ./images
       art-organizer report ./images --top 10 --no-size
-      art-organizer report ./images --no-recursive
+      art-organizer report ./images --images-only
+      art-organizer report ./images --extension .jpg
     """
     cmd_report(
         directory=directory,
@@ -216,6 +232,9 @@ def report(directory, no_recursive, no_extension, no_size, no_date, no_tag, no_d
         by_tag=not no_tag,
         by_directory=not no_directory,
         top_n=top_n,
+        images_only=images_only,
+        brushes_only=brushes_only,
+        extension=extension,
         dry_run=dry_run
     )
 

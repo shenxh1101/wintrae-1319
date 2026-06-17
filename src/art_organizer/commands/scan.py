@@ -3,7 +3,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from ..utils import (
     scan_files,
@@ -24,15 +24,30 @@ def cmd_scan(
     directory: str,
     recursive: bool = True,
     show_details: bool = False,
+    images_only: bool = False,
+    brushes_only: bool = False,
+    extension: Optional[str] = None,
     dry_run: bool = False,
 ):
     """扫描目录中的图片和画笔文件，按尺寸和格式统计。"""
     click.echo(f"\n[bold blue]扫描目录:[/bold blue] {directory}")
     click.echo(f"[bold blue]递归子目录:[/bold blue] {'是' if recursive else '否'}")
+    if images_only:
+        click.echo(f"[bold blue]筛选:[/bold blue] 仅图片")
+    elif brushes_only:
+        click.echo(f"[bold blue]筛选:[/bold blue] 仅画笔")
+    elif extension:
+        click.echo(f"[bold blue]筛选:[/bold blue] 扩展名 {extension}")
     click.echo()
 
     try:
-        files = scan_files(directory, recursive=recursive)
+        files = scan_files(
+            directory,
+            recursive=recursive,
+            images_only=images_only,
+            brushes_only=brushes_only,
+            extension_filter=extension
+        )
     except (FileNotFoundError, NotADirectoryError) as e:
         click.echo(f"[bold red]错误:[/bold red] {e}")
         return

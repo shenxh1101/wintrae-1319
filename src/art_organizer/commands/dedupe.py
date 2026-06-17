@@ -138,6 +138,7 @@ def cmd_dedupe(
                 ):
                     click.echo("[yellow]已取消删除[/yellow]")
                 else:
+                    delete_results = []
                     for file_hash, paths in duplicates.items():
                         sorted_paths = sorted(
                             paths,
@@ -146,11 +147,14 @@ def cmd_dedupe(
                         )
                         for path in sorted_paths[1:]:
                             try:
+                                file_size = path.stat().st_size
                                 send2trash(str(path))
                                 deleted_count += 1
-                                freed_space += path.stat().st_size
+                                freed_space += file_size
+                                delete_results.append((path.name, human_readable_size(file_size), "成功"))
                             except Exception as e:
                                 failed_count += 1
+                                delete_results.append((path.name, "-", f"失败: {e}"))
                                 click.echo(f"[red]删除失败 {path}: {e}[/red]")
 
                     console.print(Panel(
@@ -160,6 +164,16 @@ def cmd_dedupe(
                         title="删除完成",
                         border_style="green" if failed_count == 0 else "red"
                     ))
+
+                    if failed_count > 0:
+                        table = Table(title="删除失败详情", show_header=True, header_style="bold red")
+                        table.add_column("文件名", style="red")
+                        table.add_column("大小", justify="right")
+                        table.add_column("状态", style="red")
+                        for name, size, status in delete_results:
+                            if status.startswith("失败"):
+                                table.add_row(name, size, status)
+                        console.print(table)
     else:
         console.print(Panel(
             "[bold green]未发现重复文件[/bold green]",

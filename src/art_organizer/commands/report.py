@@ -4,7 +4,7 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.progress import track
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -33,15 +33,30 @@ def cmd_report(
     by_tag: bool = True,
     by_directory: bool = True,
     top_n: int = 20,
+    images_only: bool = False,
+    brushes_only: bool = False,
+    extension: Optional[str] = None,
     dry_run: bool = False,
 ):
     """输出素材占用空间详细报告。"""
     click.echo(f"\n[bold blue]目录:[/bold blue] {directory}")
     click.echo(f"[bold blue]递归子目录:[/bold blue] {'是' if recursive else '否'}")
+    if images_only:
+        click.echo(f"[bold blue]筛选:[/bold blue] 仅图片")
+    elif brushes_only:
+        click.echo(f"[bold blue]筛选:[/bold blue] 仅画笔")
+    elif extension:
+        click.echo(f"[bold blue]筛选:[/bold blue] 扩展名 {extension}")
     click.echo()
 
     try:
-        files = scan_files(directory, recursive=recursive)
+        files = scan_files(
+            directory,
+            recursive=recursive,
+            images_only=images_only,
+            brushes_only=brushes_only,
+            extension_filter=extension
+        )
     except (FileNotFoundError, NotADirectoryError) as e:
         click.echo(f"[bold red]错误:[/bold red] {e}")
         return

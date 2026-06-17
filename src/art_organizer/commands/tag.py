@@ -8,6 +8,7 @@ from typing import List
 from ..utils import (
     scan_files,
     add_tags_to_filename,
+    remove_tags_from_filename,
     safe_rename,
     extract_tags,
     human_readable_size,
@@ -55,8 +56,7 @@ def cmd_tag(
     for file_path in files:
         current_tags = extract_tags(file_path.name)
         if remove:
-            new_tags = [t for t in current_tags if t not in tags]
-            new_name = add_tags_to_filename(file_path.name, new_tags)
+            new_name = remove_tags_from_filename(file_path.name, tags)
         else:
             new_name = add_tags_to_filename(file_path.name, tags)
 
