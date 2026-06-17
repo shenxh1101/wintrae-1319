@@ -3,7 +3,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 from ..utils import (
     scan_files,
@@ -16,6 +16,7 @@ from ..utils import (
     parse_size_category,
 )
 from ..metadata import get_image_info
+from ..cache import scan_with_cache, get_cache_info, clear_cache, clear_all_cache
 
 console = Console()
 
@@ -27,6 +28,8 @@ def cmd_scan(
     images_only: bool = False,
     brushes_only: bool = False,
     extension: Optional[str] = None,
+    use_cache: bool = True,
+    force_refresh: bool = False,
     dry_run: bool = False,
 ):
     """扫描目录中的图片和画笔文件，按尺寸和格式统计。"""
@@ -38,16 +41,30 @@ def cmd_scan(
         click.echo(f"[bold blue]筛选:[/bold blue] 仅画笔")
     elif extension:
         click.echo(f"[bold blue]筛选:[/bold blue] 扩展名 {extension}")
+    if use_cache:
+        click.echo(f"[bold blue]使用缓存:[/bold blue] 是")
     click.echo()
 
     try:
-        files = scan_files(
-            directory,
-            recursive=recursive,
-            images_only=images_only,
-            brushes_only=brushes_only,
-            extension_filter=extension
-        )
+        if use_cache:
+            records, cache_stats = scan_with_cache(
+                directory,
+                recursive=recursive,
+                force_refresh=force_refresh,
+                images_only=images_only,
+                brushes_only=brushes_only,
+                extension_filter=extension,
+            )
+            files = [Path(r["path"]) for r in records]
+            _display_cache_stats(cache_stats)
+        else:
+            files = scan_files(
+                directory,
+                recursive=recursive,
+                images_only=images_only,
+                brushes_only=brushes_only,
+                extension_filter=extension
+            )
     except (FileNotFoundError, NotADirectoryError) as e:
         click.echo(f"[bold red]错误:[/bold red] {e}")
         return
@@ -153,3 +170,50 @@ def cmd_scan(
 
     if dry_run:
         click.echo("\n[bold yellow]预览模式: 未执行任何修改[/bold yellow]")
+
+
+def cmd_cache_info(directory: str):
+    """显示缓存信息。"""
+    info = get_cache_info(directory)
+    console.print(Panel(
+        f"[bold]缓存目录:[/bold] {info['cache_dir']}\n"
+        f"[bold]缓存文件:[/bold] {info['cache_file']}\n"
+        f"[bold]是否存在:[/bold] {'是' if info['exists'] else '否'}\n"
+        f"[bold]文件数:[/bold] {info['file_count']}\n"
+        f"[bold]生成时间:[/bold] {info.get('generated_at', '-')}\n"
+        f"[bold]缓存大小:[/bold] {human_readable_size(info['size_bytes']) if info['size_bytes'] > 0 else '-'}",
+        title="缓存信息",
+        border_style="cyan"
+    ))
+
+
+def cmd_clear_cache(directory: str, all: bool = False):
+    """清除缓存。"""
+    if all:
+        import os
+        cache_dir = os.path.join(directory, ".art-organizer-cache")
+        count = clear_all_cache(cache_dir)
+        if count > 0:
+            click.echo(f"[bold green]已清除 {count} 个缓存文件[/bold green]")
+        else:
+            click.echo("[yellow]没有找到缓存文件[/yellow]")
+    else:
+        if clear_cache(directory):
+            click.echo("[bold green]缓存已清除[/bold green]")
+        else:
+            click.echo("[yellow]没有找到该目录的缓存[/yellow]")
+
+
+def _display_cache_stats(stats: Dict[str, Any]):
+    """显示缓存统计信息。"""
+    if stats["cached_files"] > 0 or stats["changed_files"] > 0 or stats["new_files"] > 0:
+        table = Table(title="缓存使用情况", show_header=True, header_style="bold cyan")
+        table.add_column("项目", style="cyan")
+        table.add_column("数量", justify="right")
+
+        table.add_row("总文件数", str(stats["total_files"]))
+        table.add_row("[green]从缓存读取[/green]", str(stats["cached_files"]))
+        table.add_row("[yellow]新增文件[/yellow]", str(stats["new_files"]))
+        table.add_row("[magenta]变动文件[/magenta]", str(stats["changed_files"]))
+        table.add_row("[red]已删除文件[/red]", str(stats["removed_files"]))
+        console.print(table)

@@ -3,7 +3,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Any, Optional
 
 from ..utils import (
     scan_files,
@@ -15,6 +15,7 @@ from ..utils import (
     is_image_file,
 )
 from ..metadata import get_image_info
+from ..history import save_operation_history, create_change_record
 
 console = Console()
 
@@ -26,6 +27,8 @@ def cmd_tag(
     remove: bool = False,
     filter_tag: str = None,
     dry_run: bool = False,
+    save_history: bool = True,
+    history_dir: Optional[str] = None,
 ):
     """批量添加或移除主题标签到文件名。"""
     click.echo(f"\n[bold blue]目录:[/bold blue] {directory}")
@@ -102,6 +105,7 @@ def cmd_tag(
     success_count = 0
     fail_count = 0
     results = []
+    change_records: List[Dict[str, Any]] = []
 
     with click.progressbar(changes, label="处理中") as bar:
         for old_path, new_name, _ in bar:
@@ -110,9 +114,11 @@ def cmd_tag(
             if ok:
                 success_count += 1
                 results.append((old_path.name, new_name, "成功"))
+                change_records.append(create_change_record(old_path, result if isinstance(result, Path) else new_path, True))
             else:
                 fail_count += 1
                 results.append((old_path.name, new_name, f"失败: {result}"))
+                change_records.append(create_change_record(old_path, new_path, False, str(result)))
 
     console.print(Panel(
         f"[bold green]成功: {success_count}[/bold green]  |  "
@@ -130,3 +136,15 @@ def cmd_tag(
             if status.startswith("失败"):
                 table.add_row(old_name, new_name, status)
         console.print(table)
+
+    if save_history and not dry_run and (success_count > 0 or fail_count > 0):
+        desc = f"{'移除' if remove else '添加'}标签: {', '.join(tags)}"
+        hist_file = save_operation_history(
+            directory,
+            "tag",
+            change_records,
+            history_dir=history_dir,
+            description=desc
+        )
+        click.echo(f"\n[dim]操作历史已保存到: {hist_file}[/dim]")
+        click.echo("[dim]使用 'art-organizer undo' 可撤回此操作[/dim]")

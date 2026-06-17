@@ -6,7 +6,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 from ..utils import (
     scan_files,
@@ -16,10 +16,41 @@ from ..utils import (
     get_file_date,
     is_image_file,
     is_brush_file,
+    calculate_hash,
 )
 from ..metadata import get_image_info
+from ..config import get_config_value
 
 console = Console()
+
+
+def apply_delivery_template(
+    template: str,
+    file_path: Path,
+    variables: Dict[str, Any]
+) -> Path:
+    """应用交付模板生成目录路径。"""
+    tags = extract_tags(file_path.name)
+    primary_tag = tags[0] if tags else "未分类"
+
+    template_vars = {
+        "project": variables.get("project", ""),
+        "client": variables.get("client", ""),
+        "type": "images" if is_image_file(file_path) else "brushes",
+        "tags": '_'.join(tags) if tags else "未分类",
+        "tag": primary_tag,
+        "date": variables.get("date", datetime.now().strftime("%Y%m%d")),
+        "year": datetime.now().strftime("%Y"),
+        "month": datetime.now().strftime("%m"),
+    }
+
+    try:
+        path_str = template.format(**template_vars)
+        path_str = path_str.replace('//', '/').strip('/')
+        return Path(path_str)
+    except Exception as e:
+        click.echo(f"[yellow]模板解析错误: {e}，使用默认路径[/yellow]")
+        return Path(primary_tag)
 
 
 def group_by_project(files: List[Path], group_by: str) -> Dict[str, List[Path]]:
@@ -57,14 +88,17 @@ def generate_manifest(
     group_name: str,
     delivery_path: Optional[Path] = None,
     format: str = "json",
+    include_checksum: bool = True,
 ):
-    """生成素材包清单文件。"""
+    """生成素材包清单文件，包含文件校验值。"""
     image_count = sum(1 for f in files if is_image_file(f))
     brush_count = sum(1 for f in files if is_brush_file(f))
     all_tags = []
     for f in files:
         all_tags.extend(extract_tags(f.name))
     unique_tags = sorted(list(set(all_tags)))
+
+    total_size = sum(f.stat().st_size for f in files)
 
     manifest = {
         "manifest_info": {
@@ -76,8 +110,8 @@ def generate_manifest(
         },
         "summary": {
             "total_files": len(files),
-            "total_size_bytes": sum(f.stat().st_size for f in files),
-            "total_size_human": human_readable_size(sum(f.stat().st_size for f in files)),
+            "total_size_bytes": total_size,
+            "total_size_human": human_readable_size(total_size),
             "image_files": image_count,
             "brush_files": brush_count,
             "unique_tags": unique_tags,
@@ -86,6 +120,10 @@ def generate_manifest(
         "delivery_structure": {
             "root": group_name,
             "files": [f.name for f in sorted(files)],
+        },
+        "checksum_info": {
+            "algorithm": "SHA-256",
+            "included": include_checksum,
         },
         "files": []
     }
@@ -107,6 +145,8 @@ def generate_manifest(
             "created_at": get_file_date(file_path).isoformat(),
             "created_at_formatted": get_file_date(file_path).strftime("%Y-%m-%d %H:%M:%S"),
         }
+        if include_checksum:
+            file_entry["sha256"] = calculate_hash(file_path)
         if info["dimensions"]:
             file_entry["width"] = info["dimensions"][0]
             file_entry["height"] = info["dimensions"][1]
@@ -124,14 +164,17 @@ def generate_manifest(
     elif format == "csv":
         with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([
+            headers = [
                 "序号", "文件名", "来源路径", "来源目录", "交付路径",
                 "大小(字节)", "大小", "扩展名", "类型",
                 "标签", "标签格式", "创建日期",
-                "宽度", "高度", "分辨率", "宽高比", "图片格式", "色彩模式"
-            ])
+                "宽度", "高度", "分辨率", "宽高比", "图片格式", "色彩模式",
+            ]
+            if include_checksum:
+                headers.append("SHA-256")
+            writer.writerow(headers)
             for idx, fe in enumerate(manifest["files"], 1):
-                writer.writerow([
+                row = [
                     idx,
                     fe["filename"],
                     fe["source_path"],
@@ -150,7 +193,10 @@ def generate_manifest(
                     fe.get("aspect_ratio", ""),
                     fe.get("image_format", ""),
                     fe.get("color_mode", ""),
-                ])
+                ]
+                if include_checksum:
+                    row.append(fe.get("sha256", ""))
+                writer.writerow(row)
 
     return manifest
 
@@ -160,6 +206,7 @@ def generate_summary_manifest(
     output_path: Path,
     source_directory: str,
     format: str = "json",
+    include_checksum: bool = True,
 ):
     """生成总的素材包汇总清单。"""
     total_files = sum(len(files) for files in all_groups.values())
@@ -183,6 +230,10 @@ def generate_summary_manifest(
             "total_size_human": human_readable_size(total_size),
             "unique_tags": unique_tags,
             "tags_count": len(unique_tags),
+        },
+        "checksum_info": {
+            "algorithm": "SHA-256",
+            "included": include_checksum,
         },
         "groups": [],
     }
@@ -232,18 +283,36 @@ def cmd_pack(
     manifest_format: str = "json",
     manifest_only: bool = False,
     recursive: bool = True,
+    delivery_template: Optional[str] = None,
+    project: Optional[str] = None,
+    client: Optional[str] = None,
+    no_checksum: bool = False,
+    config: Optional[Dict[str, Any]] = None,
     dry_run: bool = False,
 ):
     """生成素材包清单并按项目复制到交付目录。"""
+    if config is None:
+        config = {}
+
+    if delivery_template is None:
+        delivery_template = get_config_value(config, "delivery_template", "{tag}")
+    if output_dir is None:
+        output_dir = get_config_value(config, "output_dir", "./delivery")
+
     click.echo(f"\n[bold blue]源目录:[/bold blue] {directory}")
-    if output_dir:
-        click.echo(f"[bold blue]输出目录:[/bold blue] {output_dir}")
+    click.echo(f"[bold blue]输出目录:[/bold blue] {output_dir}")
     click.echo(f"[bold blue]分组方式:[/bold blue] {group_by}")
     if project_tag:
         click.echo(f"[bold blue]项目标签:[/bold blue] {project_tag}")
     click.echo(f"[bold blue]清单格式:[/bold blue] {manifest_format}")
     click.echo(f"[bold blue]仅生成清单:[/bold blue] {'是' if manifest_only else '否'}")
     click.echo(f"[bold blue]递归子目录:[/bold blue] {'是' if recursive else '否'}")
+    click.echo(f"[bold blue]交付模板:[/bold blue] {delivery_template}")
+    if project:
+        click.echo(f"[bold blue]项目名:[/bold blue] {project}")
+    if client:
+        click.echo(f"[bold blue]客户名:[/bold blue] {client}")
+    click.echo(f"[bold blue]包含校验值:[/bold blue] {'否' if no_checksum else '是'}")
     click.echo()
 
     try:
@@ -278,82 +347,167 @@ def cmd_pack(
         )
     console.print(table)
 
-    if manifest_only and not output_dir:
+    if not output_dir:
         click.echo("[yellow]请指定 --output-dir 用于存放清单文件[/yellow]")
         return
 
-    if not manifest_only and not output_dir:
-        click.echo("[yellow]请指定 --output-dir 用于存放复制的文件[/yellow]")
-        return
-
-    output_path = Path(output_dir) if output_dir else None
+    output_path = Path(output_dir)
     if output_path and not dry_run:
         output_path.mkdir(parents=True, exist_ok=True)
 
+    template_vars = {
+        "project": project or "",
+        "client": client or "",
+        "date": datetime.now().strftime("%Y%m%d"),
+    }
+
     all_manifest_files = []
     copy_results = []
+    include_checksum = not no_checksum
 
     for group_name, group_files in sorted(groups.items()):
         safe_group_name = "".join(c for c in group_name if c.isalnum() or c in (' ', '-', '_')).strip()
         if not safe_group_name:
             safe_group_name = "未命名"
 
-        group_output_dir = output_path / safe_group_name if output_path else None
+        group_output_dir = output_path / safe_group_name if not manifest_only else None
         if group_output_dir and not dry_run and not manifest_only:
             group_output_dir.mkdir(parents=True, exist_ok=True)
 
-        if output_path:
-            manifest_filename = f"{safe_group_name}_manifest.{manifest_format}"
-            manifest_path = output_path / manifest_filename
-            if dry_run:
-                click.echo(f"[yellow]将生成清单:[/yellow] {manifest_path}")
-            else:
-                manifest = generate_manifest(
-                    group_files,
-                    manifest_path,
-                    source_directory=directory,
-                    group_name=group_name,
-                    delivery_path=group_output_dir,
-                    format=manifest_format
-                )
-                click.echo(f"[green]已生成清单:[/green] {manifest_path}")
-                all_manifest_files.extend(group_files)
+        manifest_filename = f"{safe_group_name}_manifest.{manifest_format}"
+        manifest_path = output_path / manifest_filename
+        if dry_run:
+            click.echo(f"[yellow]将生成清单:[/yellow] {manifest_path}")
+        else:
+            manifest = generate_manifest(
+                group_files,
+                manifest_path,
+                source_directory=directory,
+                group_name=group_name,
+                delivery_path=group_output_dir,
+                format=manifest_format,
+                include_checksum=include_checksum,
+            )
+            click.echo(f"[green]已生成清单:[/green] {manifest_path}")
+            all_manifest_files.extend(group_files)
 
         if not manifest_only and group_output_dir:
             for file_path in group_files:
-                dst_path = group_output_dir / file_path.name
+                sub_path = apply_delivery_template(delivery_template, file_path, template_vars)
+                dst_dir = group_output_dir / sub_path
+                if not dry_run:
+                    dst_dir.mkdir(parents=True, exist_ok=True)
+                dst_path = dst_dir / file_path.name
+
                 if dry_run:
-                    click.echo(f"[yellow]将复制:[/yellow] {file_path.name} -> {group_output_dir}/")
+                    click.echo(f"[yellow]将复制:[/yellow] {file_path.name} -> {dst_path.parent}/")
                 else:
                     ok, result = safe_copy(file_path, dst_path, dry_run=False)
                     if ok:
-                        copy_results.append((file_path.name, group_name, "成功"))
+                        copy_results.append((file_path.name, group_name, str(sub_path), "成功"))
                     else:
-                        copy_results.append((file_path.name, group_name, f"失败: {result}"))
+                        copy_results.append((file_path.name, group_name, str(sub_path), f"失败: {result}"))
 
-    if all_manifest_files and output_path and not dry_run:
+    if all_manifest_files and not dry_run:
         summary_filename = f"00_素材包汇总_manifest.{manifest_format}"
         summary_path = output_path / summary_filename
         summary = generate_summary_manifest(
             groups,
             summary_path,
             source_directory=directory,
-            format=manifest_format
+            format=manifest_format,
+            include_checksum=include_checksum,
         )
         click.echo(f"[green]已生成汇总清单:[/green] {summary_path}")
 
+        if include_checksum:
+            verify_script_path = output_path / "verify_files.py"
+            with open(verify_script_path, 'w', encoding='utf-8') as f:
+                f.write('''#!/usr/bin/env python3
+"""文件校验脚本 - 用于核对交付文件的完整性"""
+import json
+import hashlib
+from pathlib import Path
+from datetime import datetime
+
+def calculate_hash(file_path):
+    """计算文件的 SHA-256 哈希值"""
+    sha256 = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+def verify_manifest(manifest_path):
+    """校验清单中的所有文件"""
+    with open(manifest_path, 'r', encoding='utf-8') as f:
+        manifest = json.load(f)
+
+    print(f"\\n{'='*60}")
+    print(f"文件校验报告 - {manifest['manifest_info']['group_name']}")
+    print(f"生成时间: {manifest['manifest_info']['generated_at']}")
+    print(f"{'='*60}\\n")
+
+    total = len(manifest['files'])
+    passed = 0
+    failed = 0
+    missing = 0
+
+    for file_entry in manifest['files']:
+        filename = file_entry['filename']
+        expected_hash = file_entry.get('sha256', '')
+
+        delivery_path = Path(file_entry.get('delivery_path', filename))
+        if not delivery_path.exists():
+            delivery_path = Path(filename)
+
+        if not delivery_path.exists():
+            print(f"[缺失] {filename}")
+            missing += 1
+            continue
+
+        actual_hash = calculate_hash(delivery_path)
+        if actual_hash == expected_hash:
+            print(f"[通过] {filename}")
+            passed += 1
+        else:
+            print(f"[失败] {filename}")
+            print(f"       期望: {expected_hash}")
+            print(f"       实际: {actual_hash}")
+            failed += 1
+
+    print(f"\\n{'='*60}")
+    print(f"校验完成: 总计 {total}, 通过 {passed}, 失败 {failed}, 缺失 {missing}")
+    print(f"{'='*60}")
+
+    return failed == 0 and missing == 0
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        manifest_file = sys.argv[1]
+    else:
+        manifest_file = "00_素材包汇总_manifest.json"
+
+    success = verify_manifest(manifest_file)
+    sys.exit(0 if success else 1)
+''')
+            click.echo(f"[green]已生成校验脚本:[/green] {verify_script_path}")
+
         total_size = sum(f.stat().st_size for f in all_manifest_files)
+        checksum_note = "\n[dim]清单包含 SHA-256 校验值，可用于核对文件完整性[/dim]" if include_checksum else ""
         console.print(Panel(
             f"[bold]已生成 {len(groups)} 个分组清单 + 1 个汇总清单[/bold]\n"
             f"共 {len(all_manifest_files)} 个文件\n"
             f"[bold]总大小: {human_readable_size(total_size)}[/bold]\n"
-            f"[bold]汇总清单:[/bold] {summary_path.name}",
+            f"[bold]交付模板:[/bold] {delivery_template}\n"
+            f"[bold]汇总清单:[/bold] {summary_path.name}{checksum_note}",
             title="清单生成完成",
             border_style="green"
         ))
 
     if copy_results:
-        success_count = sum(1 for r in copy_results if r[2] == "成功")
+        success_count = sum(1 for r in copy_results if r[3] == "成功")
         fail_count = len(copy_results) - success_count
 
         console.print(Panel(
@@ -367,10 +521,11 @@ def cmd_pack(
             table = Table(title="复制失败详情", show_header=True, header_style="bold red")
             table.add_column("文件名", style="red")
             table.add_column("项目", style="yellow")
+            table.add_column("子目录", style="cyan")
             table.add_column("错误", style="red")
-            for name, group, status in copy_results:
+            for name, group, subdir, status in copy_results:
                 if status != "成功":
-                    table.add_row(name, group, status)
+                    table.add_row(name, group, subdir, status)
             console.print(table)
 
     if dry_run:

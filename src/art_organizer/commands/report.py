@@ -1,10 +1,13 @@
 import click
+import json
+import csv
+import hashlib
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.progress import track
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any, Tuple
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -18,10 +21,114 @@ from ..utils import (
     extract_tags,
     get_file_date,
     parse_size_category,
+    calculate_hash,
 )
 from ..metadata import get_image_info
+from ..config import get_config_value
 
 console = Console()
+
+
+def get_report_dir(base_dir: str, report_dir: Optional[str] = None) -> Path:
+    """获取报告目录。"""
+    if report_dir:
+        report_path = Path(report_dir)
+    else:
+        report_path = Path(base_dir) / "reports"
+    report_path.mkdir(parents=True, exist_ok=True)
+    return report_path
+
+
+def get_previous_report(report_dir: Path) -> Optional[Dict[str, Any]]:
+    """获取最近的历史报告。"""
+    report_files = sorted(report_dir.glob("report_*.json"), reverse=True)
+    for rf in report_files[1:]:
+        try:
+            with open(rf, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return None
+
+
+def compare_reports(
+    current: Dict[str, Any],
+    previous: Dict[str, Any]
+) -> Dict[str, Any]:
+    """对比两个报告，找出差异。"""
+    current_files = {f["path"]: f for f in current.get("files", [])}
+    previous_files = {f["path"]: f for f in previous.get("files", [])}
+
+    added = []
+    removed = []
+    changed = []
+    grew = []
+
+    for path, info in current_files.items():
+        if path not in previous_files:
+            added.append(info)
+        else:
+            prev_info = previous_files[path]
+            if info["size_bytes"] != prev_info["size_bytes"]:
+                changed.append({
+                    "path": path,
+                    "name": info["name"],
+                    "old_size": prev_info["size_bytes"],
+                    "new_size": info["size_bytes"],
+                    "size_diff": info["size_bytes"] - prev_info["size_bytes"],
+                })
+                if info["size_bytes"] > prev_info["size_bytes"]:
+                    grew.append(changed[-1])
+
+    for path, info in previous_files.items():
+        if path not in current_files:
+            removed.append(info)
+
+    current_total = current.get("summary", {}).get("total_size_bytes", 0)
+    previous_total = previous.get("summary", {}).get("total_size_bytes", 0)
+
+    return {
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "grew": grew,
+        "total_size_diff": current_total - previous_total,
+        "total_count_diff": len(current_files) - len(previous_files),
+    }
+
+
+def export_report_json(report_data: Dict[str, Any], output_path: Path) -> None:
+    """导出报告为 JSON 格式。"""
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(report_data, f, ensure_ascii=False, indent=2)
+
+
+def export_report_csv(report_data: Dict[str, Any], output_path: Path) -> None:
+    """导出报告为 CSV 格式。"""
+    files = report_data.get("files", [])
+    with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "序号", "文件名", "路径", "扩展名", "类型",
+            "大小(字节)", "大小", "宽度", "高度", "分辨率",
+            "标签", "创建日期", "目录"
+        ])
+        for idx, fe in enumerate(files, 1):
+            writer.writerow([
+                idx,
+                fe["name"],
+                fe["path"],
+                fe["extension"],
+                fe["type"],
+                fe["size_bytes"],
+                fe["size_human"],
+                fe.get("width", ""),
+                fe.get("height", ""),
+                fe.get("resolution", ""),
+                ','.join(fe.get("tags", [])),
+                fe.get("created_at", ""),
+                fe.get("directory", ""),
+            ])
 
 
 def cmd_report(
@@ -36,9 +143,19 @@ def cmd_report(
     images_only: bool = False,
     brushes_only: bool = False,
     extension: Optional[str] = None,
+    export_format: Optional[str] = None,
+    compare: bool = False,
+    report_dir: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
     dry_run: bool = False,
 ):
     """输出素材占用空间详细报告。"""
+    if config is None:
+        config = {}
+
+    if report_dir is None:
+        report_dir = get_config_value(config, "report_dir", None)
+
     click.echo(f"\n[bold blue]目录:[/bold blue] {directory}")
     click.echo(f"[bold blue]递归子目录:[/bold blue] {'是' if recursive else '否'}")
     if images_only:
@@ -47,6 +164,10 @@ def cmd_report(
         click.echo(f"[bold blue]筛选:[/bold blue] 仅画笔")
     elif extension:
         click.echo(f"[bold blue]筛选:[/bold blue] 扩展名 {extension}")
+    if export_format:
+        click.echo(f"[bold blue]导出格式:[/bold blue] {export_format}")
+    if compare:
+        click.echo(f"[bold blue]对比模式:[/bold blue] 开启")
     click.echo()
 
     try:
@@ -77,6 +198,7 @@ def cmd_report(
     tag_stats: Dict[str, Dict] = defaultdict(lambda: {"count": 0, "size": 0})
     dir_stats: Dict[str, Dict] = defaultdict(lambda: {"count": 0, "size": 0})
     largest_files: List[tuple] = []
+    file_entries: List[Dict[str, Any]] = []
 
     for file_path in track(files, description="分析中..."):
         try:
@@ -94,12 +216,26 @@ def cmd_report(
             ext_stats[ext]["count"] += 1
             ext_stats[ext]["size"] += file_size
 
-            if is_image_file(file_path):
-                info = get_image_info(file_path)
-                if info["dimensions"]:
-                    category = parse_size_category(info["dimensions"][0], info["dimensions"][1])
-                    size_stats[category]["count"] += 1
-                    size_stats[category]["size"] += file_size
+            info = get_image_info(file_path)
+            file_entry = {
+                "path": str(file_path.resolve()),
+                "name": file_path.name,
+                "extension": ext,
+                "type": "image" if is_image_file(file_path) else "brush",
+                "size_bytes": file_size,
+                "size_human": human_readable_size(file_size),
+                "tags": extract_tags(file_path.name),
+                "directory": str(file_path.parent),
+                "created_at": get_file_date(file_path).strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            if info["dimensions"]:
+                file_entry["width"] = info["dimensions"][0]
+                file_entry["height"] = info["dimensions"][1]
+                file_entry["resolution"] = f"{info['dimensions'][0]}x{info['dimensions'][1]}"
+                category = parse_size_category(info["dimensions"][0], info["dimensions"][1])
+                size_stats[category]["count"] += 1
+                size_stats[category]["size"] += file_size
+            file_entries.append(file_entry)
 
             file_date = get_file_date(file_path)
             date_key = file_date.strftime("%Y-%m")
@@ -231,5 +367,100 @@ def cmd_report(
             )
         console.print(table)
 
+    report_data = {
+        "generated_at": datetime.now().isoformat(),
+        "directory": str(Path(directory).resolve()),
+        "summary": {
+            "total_files": len(files),
+            "total_size_bytes": total_size,
+            "total_size_human": human_readable_size(total_size),
+            "image_count": image_count,
+            "image_size_bytes": image_size,
+            "brush_count": brush_count,
+            "brush_size_bytes": brush_size,
+        },
+        "files": file_entries,
+        "stats": {
+            "by_extension": dict(ext_stats),
+            "by_size": dict(size_stats),
+            "by_date": dict(date_stats),
+            "by_tag": dict(tag_stats),
+            "by_directory": dict(dir_stats),
+        }
+    }
+
+    if compare:
+        rpt_dir = get_report_dir(directory, report_dir)
+        prev_report = get_previous_report(rpt_dir)
+        if prev_report:
+            diff = compare_reports(report_data, prev_report)
+            _display_comparison(diff, top_n)
+        else:
+            click.echo("\n[yellow]未找到历史报告，跳过对比[/yellow]")
+
+    if export_format and not dry_run:
+        rpt_dir = get_report_dir(directory, report_dir)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"report_{timestamp}.{export_format}"
+        output_path = rpt_dir / filename
+
+        if export_format == "json":
+            export_report_json(report_data, output_path)
+        elif export_format == "csv":
+            export_report_csv(report_data, output_path)
+
+        click.echo(f"\n[green]报告已导出:[/green] {output_path}")
+
     if dry_run:
         click.echo("\n[bold yellow]预览模式: 未执行任何修改[/bold yellow]")
+
+
+def _display_comparison(diff: Dict[str, Any], top_n: int):
+    """显示对比结果。"""
+    console.print(Panel(
+        f"[bold]与上一次报告对比[/bold]\n\n"
+        f"[cyan]文件数变化:[/cyan] {diff['total_count_diff']:+d}\n"
+        f"[cyan]空间变化:[/cyan] {human_readable_size(abs(diff['total_size_diff']))} "
+        f"({'增加' if diff['total_size_diff'] >= 0 else '减少'})\n"
+        f"[green]新增文件:[/green] {len(diff['added'])} 个\n"
+        f"[red]删除文件:[/red] {len(diff['removed'])} 个\n"
+        f"[yellow]变动文件:[/yellow] {len(diff['changed'])} 个\n"
+        f"[magenta]变大文件:[/magenta] {len(diff['grew'])} 个",
+        title="历史对比",
+        border_style="yellow"
+    ))
+
+    if diff["added"]:
+        table = Table(title=f"新增文件 (Top {top_n})", show_header=True, header_style="bold green")
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("文件名", style="green")
+        table.add_column("大小", justify="right")
+        for idx, f in enumerate(sorted(diff["added"], key=lambda x: -x["size_bytes"])[:top_n], 1):
+            table.add_row(str(idx), f["name"], f["size_human"])
+        console.print(table)
+
+    if diff["removed"]:
+        table = Table(title=f"删除文件 (Top {top_n})", show_header=True, header_style="bold red")
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("文件名", style="red")
+        table.add_column("大小", justify="right")
+        for idx, f in enumerate(sorted(diff["removed"], key=lambda x: -x["size_bytes"])[:top_n], 1):
+            table.add_row(str(idx), f["name"], f["size_human"])
+        console.print(table)
+
+    if diff["grew"]:
+        table = Table(title=f"变大文件 (Top {top_n})", show_header=True, header_style="bold magenta")
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("文件名", style="magenta")
+        table.add_column("原大小", justify="right")
+        table.add_column("新大小", justify="right")
+        table.add_column("增量", justify="right")
+        for idx, f in enumerate(sorted(diff["grew"], key=lambda x: -x["size_diff"])[:top_n], 1):
+            table.add_row(
+                str(idx),
+                f["name"],
+                human_readable_size(f["old_size"]),
+                human_readable_size(f["new_size"]),
+                f"+{human_readable_size(f['size_diff'])}"
+            )
+        console.print(table)
