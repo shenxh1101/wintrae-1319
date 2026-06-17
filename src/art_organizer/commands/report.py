@@ -1,6 +1,7 @@
 import click
 import json
 import csv
+import re
 import hashlib
 from rich.console import Console
 from rich.table import Table
@@ -39,16 +40,103 @@ def get_report_dir(base_dir: str, report_dir: Optional[str] = None) -> Path:
     return report_path
 
 
-def get_previous_report(report_dir: Path) -> Optional[Dict[str, Any]]:
-    """获取最近的历史报告。"""
-    report_files = sorted(report_dir.glob("report_*.json"), reverse=True)
-    for rf in report_files[1:]:
-        try:
-            with open(rf, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
+def _parse_report_from_json(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _parse_report_from_csv(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+            reader = csv.DictReader(f)
+            files = []
+            for row in reader:
+                size_bytes = int(row.get("大小(字节)", 0) or 0)
+                tags_str = row.get("标签", "")
+                tags = [t.strip() for t in tags_str.split(',') if t.strip()] if tags_str else []
+                fe = {
+                    "path": row.get("路径", ""),
+                    "name": row.get("文件名", ""),
+                    "extension": row.get("扩展名", ""),
+                    "type": row.get("类型", ""),
+                    "size_bytes": size_bytes,
+                    "size_human": row.get("大小", ""),
+                    "tags": tags,
+                    "directory": row.get("目录", ""),
+                    "created_at": row.get("创建日期", ""),
+                }
+                width = row.get("宽度", "")
+                height = row.get("高度", "")
+                if width and height:
+                    fe["width"] = int(width)
+                    fe["height"] = int(height)
+                    fe["resolution"] = row.get("分辨率", "")
+                files.append(fe)
+
+        total_size = sum(fe["size_bytes"] for fe in files)
+        total_files = len(files)
+        image_count = sum(1 for fe in files if fe["type"] == "图片")
+        brush_count = sum(1 for fe in files if fe["type"] == "画笔")
+        image_size = sum(fe["size_bytes"] for fe in files if fe["type"] == "图片")
+        brush_size = sum(fe["size_bytes"] for fe in files if fe["type"] == "画笔")
+
+        ts_match = re.search(r'report_(\d{8}_\d{6})', path.name)
+        generated_at = ""
+        if ts_match:
+            generated_at = datetime.strptime(ts_match.group(1), "%Y%m%d_%H%M%S").isoformat()
+
+        return {
+            "generated_at": generated_at,
+            "directory": "",
+            "summary": {
+                "total_files": total_files,
+                "total_size_bytes": total_size,
+                "total_size_human": human_readable_size(total_size),
+                "image_count": image_count,
+                "image_size_bytes": image_size,
+                "brush_count": brush_count,
+                "brush_size_bytes": brush_size,
+            },
+            "files": files,
+        }
+    except Exception:
+        return None
+
+
+def get_previous_report(report_dir: Path) -> Tuple[Optional[Dict[str, Any]], Optional[Path]]:
+    """获取最近的历史报告，同时返回报告文件路径。
+
+    对比始终在导出之前执行，所以目录中的报告都是已保存的历史版本，
+    直接取最新的一份作为对比基准。
+
+    Returns:
+        (报告数据, 报告文件路径) 或 (None, None)
+    """
+    all_reports = []
+    for p in report_dir.glob("report_*"):
+        if p.suffix.lower() not in ('.json', '.csv'):
             continue
-    return None
+        all_reports.append(p)
+
+    if not all_reports:
+        return None, None
+
+    all_reports.sort(reverse=True)
+
+    for rf in all_reports:
+        if rf.suffix.lower() == '.json':
+            data = _parse_report_from_json(rf)
+        elif rf.suffix.lower() == '.csv':
+            data = _parse_report_from_csv(rf)
+        else:
+            continue
+        if data is not None:
+            return data, rf
+
+    return None, None
 
 
 def compare_reports(
@@ -391,10 +479,17 @@ def cmd_report(
 
     if compare:
         rpt_dir = get_report_dir(directory, report_dir)
-        prev_report = get_previous_report(rpt_dir)
-        if prev_report:
+        prev_report, prev_path = get_previous_report(rpt_dir)
+        if prev_report and prev_path:
             diff = compare_reports(report_data, prev_report)
-            _display_comparison(diff, top_n)
+            prev_label = prev_path.name
+            prev_time = prev_report.get("generated_at", "")
+            if prev_time:
+                try:
+                    prev_time = datetime.fromisoformat(prev_time).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    prev_time = ""
+            _display_comparison(diff, top_n, prev_label, prev_time)
         else:
             click.echo("\n[yellow]未找到历史报告，跳过对比[/yellow]")
 
@@ -415,10 +510,14 @@ def cmd_report(
         click.echo("\n[bold yellow]预览模式: 未执行任何修改[/bold yellow]")
 
 
-def _display_comparison(diff: Dict[str, Any], top_n: int):
+def _display_comparison(diff: Dict[str, Any], top_n: int, prev_label: str = "", prev_time: str = ""):
     """显示对比结果。"""
+    version_info = f"[bold]对比基准:[/bold] {prev_label}"
+    if prev_time:
+        version_info += f"  ({prev_time})"
     console.print(Panel(
         f"[bold]与上一次报告对比[/bold]\n\n"
+        f"{version_info}\n\n"
         f"[cyan]文件数变化:[/cyan] {diff['total_count_diff']:+d}\n"
         f"[cyan]空间变化:[/cyan] {human_readable_size(abs(diff['total_size_diff']))} "
         f"({'增加' if diff['total_size_diff'] >= 0 else '减少'})\n"

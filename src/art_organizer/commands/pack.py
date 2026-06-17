@@ -89,8 +89,20 @@ def generate_manifest(
     delivery_path: Optional[Path] = None,
     format: str = "json",
     include_checksum: bool = True,
+    file_delivery_paths: Optional[Dict[str, Path]] = None,
+    base_dir: Optional[Path] = None,
 ):
-    """生成素材包清单文件，包含文件校验值。"""
+    """生成素材包清单文件，包含文件校验值。
+
+    Args:
+        file_delivery_paths: 文件名到实际交付路径的映射。
+            当使用交付模板时，实际复制路径包含模板子目录，
+            须通过此参数传入以确保清单中的路径与实际位置一致。
+        base_dir: 交付根目录，用于将绝对路径转换为相对路径。
+    """
+    if file_delivery_paths is None:
+        file_delivery_paths = {}
+
     image_count = sum(1 for f in files if is_image_file(f))
     brush_count = sum(1 for f in files if is_brush_file(f))
     all_tags = []
@@ -100,12 +112,20 @@ def generate_manifest(
 
     total_size = sum(f.stat().st_size for f in files)
 
+    def _rel_path(p: Path) -> str:
+        if base_dir is not None:
+            try:
+                return str(p.relative_to(base_dir))
+            except ValueError:
+                pass
+        return str(p)
+
     manifest = {
         "manifest_info": {
             "generated_at": datetime.now().isoformat(),
             "group_name": group_name,
             "source_directory": str(Path(source_directory).resolve()),
-            "delivery_directory": str(delivery_path.resolve()) if delivery_path else None,
+            "delivery_directory": _rel_path(delivery_path.resolve()) if delivery_path else None,
             "manifest_file": str(output_path.resolve()),
         },
         "summary": {
@@ -131,11 +151,20 @@ def generate_manifest(
     for file_path in sorted(files):
         info = get_image_info(file_path)
         tags = extract_tags(file_path.name)
+
+        actual_delivery = file_delivery_paths.get(file_path.name)
+        if actual_delivery is not None:
+            delivery_entry = _rel_path(actual_delivery)
+        elif delivery_path:
+            delivery_entry = _rel_path(delivery_path / file_path.name)
+        else:
+            delivery_entry = None
+
         file_entry = {
             "filename": file_path.name,
             "source_path": str(file_path.resolve()),
             "source_directory": str(file_path.parent.resolve()),
-            "delivery_path": str(delivery_path / file_path.name) if delivery_path else None,
+            "delivery_path": delivery_entry,
             "size_bytes": file_path.stat().st_size,
             "size_human": human_readable_size(file_path.stat().st_size),
             "extension": info["extension"],
@@ -364,6 +393,7 @@ def cmd_pack(
     all_manifest_files = []
     copy_results = []
     include_checksum = not no_checksum
+    all_delivery_paths: Dict[str, Dict[str, Path]] = {}
 
     for group_name, group_files in sorted(groups.items()):
         safe_group_name = "".join(c for c in group_name if c.isalnum() or c in (' ', '-', '_')).strip()
@@ -373,6 +403,16 @@ def cmd_pack(
         group_output_dir = output_path / safe_group_name if not manifest_only else None
         if group_output_dir and not dry_run and not manifest_only:
             group_output_dir.mkdir(parents=True, exist_ok=True)
+
+        file_delivery_paths: Dict[str, Path] = {}
+        if not manifest_only and group_output_dir:
+            for file_path in group_files:
+                sub_path = apply_delivery_template(delivery_template, file_path, template_vars)
+                dst_dir = group_output_dir / sub_path
+                dst_path = dst_dir / file_path.name
+                file_delivery_paths[file_path.name] = dst_path
+
+        all_delivery_paths[group_name] = file_delivery_paths
 
         manifest_filename = f"{safe_group_name}_manifest.{manifest_format}"
         manifest_path = output_path / manifest_filename
@@ -387,6 +427,8 @@ def cmd_pack(
                 delivery_path=group_output_dir,
                 format=manifest_format,
                 include_checksum=include_checksum,
+                file_delivery_paths=file_delivery_paths if file_delivery_paths else None,
+                base_dir=output_path,
             )
             click.echo(f"[green]已生成清单:[/green] {manifest_path}")
             all_manifest_files.extend(group_files)
@@ -427,6 +469,7 @@ def cmd_pack(
 """文件校验脚本 - 用于核对交付文件的完整性"""
 import json
 import hashlib
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -438,8 +481,29 @@ def calculate_hash(file_path):
             sha256.update(chunk)
     return sha256.hexdigest()
 
+def resolve_delivery_path(delivery_path_str, manifest_dir):
+    """根据交付路径字符串解析实际文件位置。
+
+    delivery_path 在清单中存储为相对于交付根目录的路径。
+    校验脚本应从交付根目录运行，所以先相对于脚本所在目录查找，
+    再尝试其他可能的位置。
+    """
+    p = Path(delivery_path_str)
+
+    if p.is_absolute() and p.exists():
+        return p
+
+    for base in [manifest_dir, manifest_dir.parent]:
+        candidate = base / p
+        if candidate.exists():
+            return candidate
+
+    return manifest_dir / p
+
 def verify_manifest(manifest_path):
     """校验清单中的所有文件"""
+    manifest_dir = Path(manifest_path).resolve().parent
+
     with open(manifest_path, 'r', encoding='utf-8') as f:
         manifest = json.load(f)
 
@@ -456,22 +520,26 @@ def verify_manifest(manifest_path):
     for file_entry in manifest['files']:
         filename = file_entry['filename']
         expected_hash = file_entry.get('sha256', '')
+        delivery_path_str = file_entry.get('delivery_path', '')
 
-        delivery_path = Path(file_entry.get('delivery_path', filename))
-        if not delivery_path.exists():
-            delivery_path = Path(filename)
+        if delivery_path_str:
+            delivery_file = resolve_delivery_path(delivery_path_str, manifest_dir)
+        else:
+            delivery_file = manifest_dir / filename
 
-        if not delivery_path.exists():
+        if not delivery_file.exists():
             print(f"[缺失] {filename}")
+            print(f"       预期路径: {delivery_file}")
             missing += 1
             continue
 
-        actual_hash = calculate_hash(delivery_path)
+        actual_hash = calculate_hash(delivery_file)
         if actual_hash == expected_hash:
             print(f"[通过] {filename}")
             passed += 1
         else:
             print(f"[失败] {filename}")
+            print(f"       文件位置: {delivery_file}")
             print(f"       期望: {expected_hash}")
             print(f"       实际: {actual_hash}")
             failed += 1
@@ -483,7 +551,6 @@ def verify_manifest(manifest_path):
     return failed == 0 and missing == 0
 
 if __name__ == "__main__":
-    import sys
     if len(sys.argv) > 1:
         manifest_file = sys.argv[1]
     else:
