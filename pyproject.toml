@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "art-organizer"
+version = "1.0.0"
+description = "插画师本地素材文件夹整理工具"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Art Organizer" }]
+license = { text = "MIT" }
+dependencies = [
+    "click>=8.1.0",
+    "Pillow>=10.0.0",
+    "send2trash>=1.8.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+art-organizer = "art_organizer.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+art_organizer = ["*.py"]
